@@ -2,8 +2,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
-	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -293,7 +291,7 @@ func (p *MuxPool) GetStream(target string) (*MuxStream, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// 尝试轮询所有的通道（Round-Robin）
+	// 轮询分配连接通道（Round-Robin）
 	for attempts := 0; attempts < p.poolSize; attempts++ {
 		idx := atomic.AddUint32(&p.index, 1) % uint32(p.poolSize)
 		client := p.clients[idx]
