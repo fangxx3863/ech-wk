@@ -42,17 +42,14 @@ var (
 	token       string
 	dnsServer   string
 	echDomain   string
-	routingMode string // 分流模式: "global", "bypass_cn", "none"
-	poolSize    int    // 并发 WebSocket 连接池大小
+	routingMode string
+	poolSize    int
 
 	echListMu sync.RWMutex
 	echList   []byte
 
-	// 中国IP列表（IPv4）
-	chinaIPRangesMu sync.RWMutex
-	chinaIPRanges   []ipRange
-
-	// 中国IP列表（IPv6）
+	chinaIPRangesMu   sync.RWMutex
+	chinaIPRanges     []ipRange
 	chinaIPV6RangesMu sync.RWMutex
 	chinaIPV6Ranges   []ipRangeV6
 
@@ -84,12 +81,12 @@ func main() {
 	flag.Parse()
 
 	if serverAddr == "" {
-		log.Fatal("必须指定服务端地址 -f\n\n示例:\n  ./client -l 127.0.0.1:1080 -f your-worker.workers.dev:443 -token your-token")
+		log.Fatal("必须指定服务端地址 -f")
 	}
 
 	log.Printf("[启动] 正在获取 ECH 配置...")
 	if err := prepareECH(); err != nil {
-		log.Printf("[警告] 获取 ECH 配置失败: %v", err)
+		log.Printf("[警告] 获取 ECH 配置失败 (将不使用ECH): %v", err)
 	}
 
 	if routingMode == "bypass_cn" {
@@ -98,14 +95,14 @@ func main() {
 		_ = loadChinaIPV6List()
 	}
 
-	// 初始化并发连接池
-	log.Printf("[启动] 初始化并发长连接池，通道数: %d", poolSize)
+	// 启动后台守护式并发池
+	log.Printf("[启动] 初始化后台守护并发池，通道数: %d", poolSize)
 	globalMuxPool = NewMuxPool(serverAddr, serverIP, token, poolSize)
 
 	runProxyServer(listenAddr)
 }
 
-// ======================== Mux 核心多路复用连接池引擎 ========================
+// ======================== Mux 核心流 ========================
 
 type MuxStream struct {
 	id         uint32
@@ -153,15 +150,23 @@ type MuxClient struct {
 	streams   sync.Map
 	streamSeq uint32
 	isClosed  bool
+	closeChan chan struct{}
 }
 
 func NewMuxClient(ws *websocket.Conn) *MuxClient {
 	c := &MuxClient{
-		wsConn: ws,
+		wsConn:    ws,
+		closeChan: make(chan struct{}),
 	}
 	go c.readLoop()
 	go c.pingLoop()
 	return c
+}
+
+func (c *MuxClient) IsClosed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.isClosed
 }
 
 func (c *MuxClient) OpenStream(target string) (*MuxStream, error) {
@@ -255,6 +260,7 @@ func (c *MuxClient) Close() {
 	}
 	c.isClosed = true
 	_ = c.wsConn.Close()
+	close(c.closeChan)
 	c.mu.Unlock()
 	c.streams.Range(func(key, value interface{}) bool {
 		stream := value.(*MuxStream)
@@ -263,62 +269,283 @@ func (c *MuxClient) Close() {
 	})
 }
 
-// MuxPool 多通道并发连接池 (支持负载均衡与自动重连)
+// ======================== 后台守护式连接池 ========================
+
 type MuxPool struct {
-	serverAddr string
-	serverIP   string
-	token      string
-	poolSize   int
-	clients    []*MuxClient
-	index      uint32
-	mu         sync.Mutex
+	poolSize int
+	clients  []*MuxClient
+	index    uint32
+	mu       sync.RWMutex
 }
 
-func NewMuxPool(serverAddr, serverIP, token string, poolSize int) *MuxPool {
-	if poolSize <= 0 {
-		poolSize = 4
+func NewMuxPool(serverAddr, serverIP, token string, size int) *MuxPool {
+	if size <= 0 {
+		size = 4
 	}
-	return &MuxPool{
-		serverAddr: serverAddr,
-		serverIP:   serverIP,
-		token:      token,
-		poolSize:   poolSize,
-		clients:    make([]*MuxClient, poolSize),
+	p := &MuxPool{
+		poolSize: size,
+		clients:  make([]*MuxClient, size),
+	}
+
+	// 启动后台守护协程维持连接池
+	for i := 0; i < size; i++ {
+		go p.maintainConnection(i, serverAddr, serverIP, token)
+	}
+
+	return p
+}
+
+func (p *MuxPool) maintainConnection(id int, serverAddr, serverIP, token string) {
+	for {
+		wsConn, err := dialWebSocketWithECH(serverAddr, serverIP, token, 1) // 单次尝试
+		if err != nil {
+			log.Printf("[通道 #%d] 建立失败: %v, 3秒后重试", id+1, err)
+			time.Sleep(3 * time.Second)
+			continue
+		}
+
+		client := NewMuxClient(wsConn)
+		
+		p.mu.Lock()
+		p.clients[id] = client
+		p.mu.Unlock()
+		
+		log.Printf("[通道 #%d] 🚀 极速通道建立成功，已加入复用池", id+1)
+
+		// 阻塞等待断开信号
+		<-client.closeChan
+
+		p.mu.Lock()
+		p.clients[id] = nil
+		p.mu.Unlock()
+
+		log.Printf("[通道 #%d] ⚠️ 通道断开，准备自动重连...", id+1)
+		time.Sleep(1 * time.Second)
 	}
 }
 
 func (p *MuxPool) GetStream(target string) (*MuxStream, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	startIdx := atomic.AddUint32(&p.index, 1)
+	
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 
-	// 轮询分配连接通道（Round-Robin）
-	for attempts := 0; attempts < p.poolSize; attempts++ {
-		idx := atomic.AddUint32(&p.index, 1) % uint32(p.poolSize)
+	// 轮询抓取一个健康的通道（非阻塞）
+	for i := 0; i < p.poolSize; i++ {
+		idx := (startIdx + uint32(i)) % uint32(p.poolSize)
 		client := p.clients[idx]
 
-		if client != nil && !client.isClosed {
+		if client != nil && !client.IsClosed() {
 			stream, err := client.OpenStream(target)
-			if err == nil {
-				return stream, nil
-			}
-			client.Close()
-			p.clients[idx] = nil
-		}
-
-		// 对应通道断开，自动发起重连
-		log.Printf("[Mux连接池] 通道 #%d 建立中...", idx+1)
-		wsConn, err := dialWebSocketWithECH(2)
-		if err == nil {
-			newClient := NewMuxClient(wsConn)
-			p.clients[idx] = newClient
-			stream, err := newClient.OpenStream(target)
 			if err == nil {
 				return stream, nil
 			}
 		}
 	}
 
-	return nil, fmt.Errorf("所有 Mux 连接池通道均连接失败")
+	return nil, fmt.Errorf("所有复用通道均不可用，请等待后台自动重连")
+}
+
+// ======================== ECH 与 WebSocket 拨号器 ========================
+
+func dialWebSocketWithECH(serverAddr, serverIP, token string, maxRetries int) (*websocket.Conn, error) {
+	host, port, path, err := parseServerAddr(serverAddr)
+	if err != nil {
+		return nil, err
+	}
+	wsURL := fmt.Sprintf("wss://%s:%s%s", host, port, path)
+
+	var lastErr error
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		echBytes, _ := getECHList()
+		tlsCfg, _ := buildTLSConfigWithECH(host, echBytes)
+
+		dialer := websocket.Dialer{
+			ReadBufferSize:  64 * 1024,
+			WriteBufferSize: 64 * 1024,
+			TLSClientConfig: tlsCfg,
+			Subprotocols: func() []string {
+				if token == "" {
+					return nil
+				}
+				return []string{token}
+			}(),
+			HandshakeTimeout: 10 * time.Second,
+		}
+
+		if serverIP != "" {
+			dialer.NetDial = func(network, address string) (net.Conn, error) {
+				_, port, err := net.SplitHostPort(address)
+				if err != nil {
+					return nil, err
+				}
+				return net.DialTimeout(network, net.JoinHostPort(serverIP, port), 10*time.Second)
+			}
+		}
+
+		wsConn, _, dialErr := dialer.Dial(wsURL, nil)
+		if dialErr == nil {
+			return wsConn, nil
+		}
+		
+		lastErr = dialErr
+		if strings.Contains(dialErr.Error(), "ECH") {
+			refreshECH()
+		}
+		time.Sleep(time.Second)
+	}
+	return nil, lastErr
+}
+
+func parseServerAddr(addr string) (host, port, path string, err error) {
+	path = "/"
+	slashIdx := strings.Index(addr, "/")
+	if slashIdx != -1 {
+		path = addr[slashIdx:]
+		addr = addr[:slashIdx]
+	}
+	host, port, err = net.SplitHostPort(addr)
+	if err != nil {
+		return "", "", "", err
+	}
+	return host, port, path, nil
+}
+
+func prepareECH() error {
+	echBase64, err := queryHTTPSRecord(echDomain, dnsServer)
+	if err != nil || echBase64 == "" {
+		return fmt.Errorf("DNS error or empty ECH")
+	}
+	raw, err := base64.StdEncoding.DecodeString(echBase64)
+	if err != nil {
+		return err
+	}
+	echListMu.Lock()
+	echList = raw
+	echListMu.Unlock()
+	return nil
+}
+
+func getECHList() ([]byte, error) {
+	echListMu.RLock()
+	defer echListMu.RUnlock()
+	if len(echList) == 0 {
+		return nil, errors.New("ECH not loaded")
+	}
+	return echList, nil
+}
+
+func refreshECH() {
+	_ = prepareECH()
+}
+
+func buildTLSConfigWithECH(serverName string, echList []byte) (*tls.Config, error) {
+	roots, err := x509.SystemCertPool()
+	if err != nil {
+		return nil, err
+	}
+	config := &tls.Config{
+		MinVersion: tls.VersionTLS13,
+		ServerName: serverName,
+		RootCAs:    roots,
+	}
+	if len(echList) > 0 {
+		_ = setECHConfig(config, echList)
+	}
+	return config, nil
+}
+
+func setECHConfig(config *tls.Config, echList []byte) error {
+	configValue := reflect.ValueOf(config).Elem()
+	field1 := configValue.FieldByName("EncryptedClientHelloConfigList")
+	if field1.IsValid() && field1.CanSet() {
+		field1.Set(reflect.ValueOf(echList))
+	}
+	return nil
+}
+
+func queryHTTPSRecord(domain, dnsServer string) (string, error) {
+	dohURL := dnsServer
+	if !strings.HasPrefix(dohURL, "https://") && !strings.HasPrefix(dohURL, "http://") {
+		dohURL = "https://" + dohURL
+	}
+	u, err := url.Parse(dohURL)
+	if err != nil {
+		return "", err
+	}
+	dnsQuery := buildDNSQuery(domain, 65)
+	q := u.Query()
+	q.Set("dns", base64.RawURLEncoding.EncodeToString(dnsQuery))
+	u.RawQuery = q.Encode()
+
+	req, _ := http.NewRequest("GET", u.String(), nil)
+	req.Header.Set("Accept", "application/dns-message")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	return parseDNSResponse(body)
+}
+
+func buildDNSQuery(domain string, qtype uint16) []byte {
+	query := make([]byte, 0, 512)
+	query = append(query, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
+	for _, label := range strings.Split(domain, ".") {
+		query = append(query, byte(len(label)))
+		query = append(query, []byte(label)...)
+	}
+	query = append(query, 0x00, byte(qtype>>8), byte(qtype), 0x00, 0x01)
+	return query
+}
+
+func parseDNSResponse(response []byte) (string, error) {
+	if len(response) < 12 {
+		return "", errors.New("short response")
+	}
+	ancount := binary.BigEndian.Uint16(response[6:8])
+	if ancount == 0 {
+		return "", errors.New("no answer")
+	}
+	offset := 12
+	for offset < len(response) && response[offset] != 0 {
+		offset += int(response[offset]) + 1
+	}
+	offset += 5
+	for i := 0; i < int(ancount); i++ {
+		if offset >= len(response) {
+			break
+		}
+		if response[offset]&0xC0 == 0xC0 {
+			offset += 2
+		} else {
+			for offset < len(response) && response[offset] != 0 {
+				offset += int(response[offset]) + 1
+			}
+			offset++
+		}
+		if offset+10 > len(response) {
+			break
+		}
+		rrType := binary.BigEndian.Uint16(response[offset : offset+2])
+		offset += 8
+		dataLen := binary.BigEndian.Uint16(response[offset : offset+2])
+		offset += 2
+		if offset+int(dataLen) > len(response) {
+			break
+		}
+		data := response[offset : offset+int(dataLen)]
+		offset += int(dataLen)
+		if rrType == 65 {
+			if ech := parseHTTPSRecord(data); ech != "" {
+				return ech, nil
+			}
+		}
+	}
+	return "", nil
 }
 
 // ======================== 工具与分流逻辑 ========================
@@ -533,230 +760,6 @@ func shouldBypassProxy(targetHost string) bool {
 	return false
 }
 
-// ======================== ECH 与 WebSocket (高性能缓冲区扩容) ========================
-
-const typeHTTPS = 65
-
-func prepareECH() error {
-	echBase64, err := queryHTTPSRecord(echDomain, dnsServer)
-	if err != nil || echBase64 == "" {
-		return fmt.Errorf("DNS error or empty ECH")
-	}
-	raw, err := base64.StdEncoding.DecodeString(echBase64)
-	if err != nil {
-		return err
-	}
-	echListMu.Lock()
-	echList = raw
-	echListMu.Unlock()
-	return nil
-}
-
-func getECHList() ([]byte, error) {
-	echListMu.RLock()
-	defer echListMu.RUnlock()
-	if len(echList) == 0 {
-		return nil, errors.New("ECH not loaded")
-	}
-	return echList, nil
-}
-
-func buildTLSConfigWithECH(serverName string, echList []byte) (*tls.Config, error) {
-	roots, err := x509.SystemCertPool()
-	if err != nil {
-		return nil, err
-	}
-	config := &tls.Config{
-		MinVersion: tls.VersionTLS13,
-		ServerName: serverName,
-		RootCAs:    roots,
-	}
-	if len(echList) > 0 {
-		_ = setECHConfig(config, echList)
-	}
-	return config, nil
-}
-
-func setECHConfig(config *tls.Config, echList []byte) error {
-	configValue := reflect.ValueOf(config).Elem()
-	field1 := configValue.FieldByName("EncryptedClientHelloConfigList")
-	if field1.IsValid() && field1.CanSet() {
-		field1.Set(reflect.ValueOf(echList))
-	}
-	return nil
-}
-
-func dialWebSocketWithECH(maxRetries int) (*websocket.Conn, error) {
-	host, port, path, err := parseServerAddr(serverAddr)
-	if err != nil {
-		return nil, err
-	}
-	wsURL := fmt.Sprintf("wss://%s:%s%s", host, port, path)
-
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		echBytes, _ := getECHList()
-		tlsCfg, _ := buildTLSConfigWithECH(host, echBytes)
-
-		// 扩容 WebSocket 缓冲区到 64KB，极大释放吞吐性能
-		dialer := websocket.Dialer{
-			ReadBufferSize:  64 * 1024,
-			WriteBufferSize: 64 * 1024,
-			TLSClientConfig: tlsCfg,
-			Subprotocols: func() []string {
-				if token == "" {
-					return nil
-				}
-				return []string{token}
-			}(),
-			HandshakeTimeout: 10 * time.Second,
-		}
-
-		if serverIP != "" {
-			dialer.NetDial = func(network, address string) (net.Conn, error) {
-				_, port, err := net.SplitHostPort(address)
-				if err != nil {
-					return nil, err
-				}
-				return net.DialTimeout(network, net.JoinHostPort(serverIP, port), 10*time.Second)
-			}
-		}
-
-		wsConn, _, dialErr := dialer.Dial(wsURL, nil)
-		if dialErr == nil {
-			return wsConn, nil
-		}
-		time.Sleep(time.Second)
-	}
-	return nil, errors.New("已达最大重试次数")
-}
-
-func parseServerAddr(addr string) (host, port, path string, err error) {
-	path = "/"
-	slashIdx := strings.Index(addr, "/")
-	if slashIdx != -1 {
-		path = addr[slashIdx:]
-		addr = addr[:slashIdx]
-	}
-	host, port, err = net.SplitHostPort(addr)
-	if err != nil {
-		return "", "", "", err
-	}
-	return host, port, path, nil
-}
-
-func queryHTTPSRecord(domain, dnsServer string) (string, error) {
-	dohURL := dnsServer
-	if !strings.HasPrefix(dohURL, "https://") && !strings.HasPrefix(dohURL, "http://") {
-		dohURL = "https://" + dohURL
-	}
-	u, err := url.Parse(dohURL)
-	if err != nil {
-		return "", err
-	}
-	dnsQuery := buildDNSQuery(domain, typeHTTPS)
-	q := u.Query()
-	q.Set("dns", base64.RawURLEncoding.EncodeToString(dnsQuery))
-	u.RawQuery = q.Encode()
-
-	req, _ := http.NewRequest("GET", u.String(), nil)
-	req.Header.Set("Accept", "application/dns-message")
-
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	return parseDNSResponse(body)
-}
-
-func buildDNSQuery(domain string, qtype uint16) []byte {
-	query := make([]byte, 0, 512)
-	query = append(query, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
-	for _, label := range strings.Split(domain, ".") {
-		query = append(query, byte(len(label)))
-		query = append(query, []byte(label)...)
-	}
-	query = append(query, 0x00, byte(qtype>>8), byte(qtype), 0x00, 0x01)
-	return query
-}
-
-func parseDNSResponse(response []byte) (string, error) {
-	if len(response) < 12 {
-		return "", errors.New("short response")
-	}
-	ancount := binary.BigEndian.Uint16(response[6:8])
-	if ancount == 0 {
-		return "", errors.New("no answer")
-	}
-	offset := 12
-	for offset < len(response) && response[offset] != 0 {
-		offset += int(response[offset]) + 1
-	}
-	offset += 5
-	for i := 0; i < int(ancount); i++ {
-		if offset >= len(response) {
-			break
-		}
-		if response[offset]&0xC0 == 0xC0 {
-			offset += 2
-		} else {
-			for offset < len(response) && response[offset] != 0 {
-				offset += int(response[offset]) + 1
-			}
-			offset++
-		}
-		if offset+10 > len(response) {
-			break
-		}
-		rrType := binary.BigEndian.Uint16(response[offset : offset+2])
-		offset += 8
-		dataLen := binary.BigEndian.Uint16(response[offset : offset+2])
-		offset += 2
-		if offset+int(dataLen) > len(response) {
-			break
-		}
-		data := response[offset : offset+int(dataLen)]
-		offset += int(dataLen)
-		if rrType == typeHTTPS {
-			if ech := parseHTTPSRecord(data); ech != "" {
-				return ech, nil
-			}
-		}
-	}
-	return "", nil
-}
-
-func parseHTTPSRecord(data []byte) string {
-	if len(data) < 2 {
-		return ""
-	}
-	offset := 2
-	if offset < len(data) && data[offset] == 0 {
-		offset++
-	} else {
-		for offset < len(data) && data[offset] != 0 {
-			offset += int(data[offset]) + 1
-		}
-		offset++
-	}
-	for offset+4 <= len(data) {
-		key := binary.BigEndian.Uint16(data[offset : offset+2])
-		length := binary.BigEndian.Uint16(data[offset+2 : offset+4])
-		offset += 4
-		if offset+int(length) > len(data) {
-			break
-		}
-		value := data[offset : offset+int(length)]
-		offset += int(length)
-		if key == 5 {
-			return base64.StdEncoding.EncodeToString(value)
-		}
-	}
-	return ""
-}
-
 // ======================== 服务端与隧道处理 ========================
 
 const (
@@ -772,7 +775,6 @@ func runProxyServer(addr string) {
 	}
 	defer listener.Close()
 
-	log.Printf("[代理] 服务器启动: %s (支持 SOCKS5 和 HTTP)", addr)
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -939,7 +941,7 @@ func handleTunnel(conn net.Conn, target, clientAddr string, mode int, firstFrame
 		return handleDirectConnection(conn, target, mode, firstFrame)
 	}
 
-	// 通过多通道复用池获取并发 Stream
+	// 闪电并发：不再同步拨号，直接从守护池中抓取一个活跃通道
 	stream, err := globalMuxPool.GetStream(target)
 	if err != nil {
 		sendErrorResponse(conn, mode)
@@ -969,7 +971,6 @@ func handleTunnel(conn net.Conn, target, clientAddr string, mode int, firstFrame
 		}
 	}
 
-	// 优化双向数据传输缓冲区（使用 64KB 避免内核瓶颈）
 	done := make(chan bool, 2)
 	go func() {
 		buf := make([]byte, 64*1024)
