@@ -1,9 +1,6 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
-	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -15,7 +12,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"reflect"
 	"strings"
 	"sync"
@@ -62,7 +58,7 @@ func main() {
 	flag.Parse()
 
 	if serverAddr == "" {
-		log.Fatal("必须指定服务端地址 -f\n\n示例:\n  ./client -l 127.0.0.1:30000 -f your-worker.workers.dev:443 -ip 104.16.x.x")
+		log.Fatal("必须指定服务端地址 -f\n\n示例:\n  ./ech-workers -l 127.0.0.1:30000 -f your-worker.workers.dev:443 -ip 104.16.x.x")
 	}
 
 	log.Printf("[启动] 正在获取 ECH 配置...")
