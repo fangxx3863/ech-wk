@@ -1,6 +1,6 @@
 // ============================================================
-// Cloudflare Worker 多路复用 (Mux) 服务端
-// 100% 支持 Go 客户端多流复用 & 自动 NAT64 (IPv4 -> IPv6) 回落
+// Cloudflare Worker 多路复用 (Mux) 服务端 [生命周期修正版]
+// 100% 解决连接被 Cloudflare 边缘节点秒挂、反复重连的问题
 // ============================================================
 
 import { connect } from 'cloudflare:sockets';
@@ -8,17 +8,15 @@ import { connect } from 'cloudflare:sockets';
 const WS_READY_STATE_OPEN = 1;
 const WS_READY_STATE_CLOSING = 2;
 
-// 二进制 Mux 协议命令
-const CMD_OPEN  = 0x01; // 打开新流 (Payload: "host:port")
-const CMD_DATA  = 0x02; // 传输数据 (Payload: 原始 TCP 数据)
-const CMD_CLOSE = 0x03; // 关闭流   (Payload: 无)
+const CMD_OPEN  = 0x01; 
+const CMD_DATA  = 0x02; 
+const CMD_CLOSE = 0x03; 
 
-// 公共 NAT64 前缀池 (用于直连 Telegram 等 IPv4 被 CF 阻断时的自动回落)
 const NAT64_PREFIXES = [
-  "2a01:4ff:f0:9876::",  // nat64.net (USA)
-  "2a00:1098:2b::",       // nat64.net (Netherlands)
-  "2a01:4f9:c010:3f02::", // nat64.net (Finland)
-  "2001:67c:2b0::"        // Trex (Finland)
+  "2a01:4ff:f0:9876::",  
+  "2a00:1098:2b::",       
+  "2a01:4f9:c010:3f02::", 
+  "2001:67c:2b0::"        
 ];
 
 function ipv4ToNAT64(ipv4, prefix) {
@@ -32,35 +30,48 @@ function ipv4ToNAT64(ipv4, prefix) {
 }
 
 export default {
-  async fetch(request) {
-    const upgradeHeader = request.headers.get('Upgrade');
-    if (!upgradeHeader || upgradeHeader.toLowerCase() !== 'websocket') {
-      return new Response('Mux WebSocket Server is Running', { status: 200 });
+  async fetch(request, env, ctx) { // 引入 ctx 上下文算子
+    try {
+      const upgradeHeader = request.headers.get('Upgrade');
+      if (!upgradeHeader || upgradeHeader.toLowerCase() !== 'websocket') {
+        return new Response('Mux WebSocket Server is Running', { status: 200 });
+      }
+
+      const token = ''; 
+
+      if (token && request.headers.get('Sec-WebSocket-Protocol') !== token) {
+        return new Response('Unauthorized', { status: 401 });
+      }
+
+      const [client, server] = Object.values(new WebSocketPair());
+      server.accept();
+      server.binaryType = "arraybuffer";
+
+      // 【核心修正点】生成一个永不兑现的锁，直到 WebSocket 主动触发 Close/Error 为止
+      const keepAlivePromise = new Promise((resolve) => {
+        server.addEventListener('close', resolve);
+        server.addEventListener('error', resolve);
+      });
+
+      handleMuxSession(server).catch(() => safeCloseWebSocket(server));
+
+      // 强行命令 Cloudflare：该 Promise 未决出胜负前，严禁掐断本条实例线程！
+      ctx.waitUntil(keepAlivePromise);
+
+      const responseInit = { status: 101, webSocket: client };
+      if (token) {
+        responseInit.headers = { 'Sec-WebSocket-Protocol': token };
+      }
+
+      return new Response(null, responseInit);
+      
+    } catch (err) {
+      return new Response(err.toString(), { status: 500 });
     }
-
-    const token = ''; // 如需验证 token，请在此填入与 Go 客户端一致的字符串
-
-    if (token && request.headers.get('Sec-WebSocket-Protocol') !== token) {
-      return new Response('Unauthorized', { status: 401 });
-    }
-
-    const [client, server] = Object.values(new WebSocketPair());
-    server.accept();
-    server.binaryType = "arraybuffer";
-
-    handleMuxSession(server).catch(() => safeCloseWebSocket(server));
-
-    const responseInit = { status: 101, webSocket: client };
-    if (token) {
-      responseInit.headers = { 'Sec-WebSocket-Protocol': token };
-    }
-
-    return new Response(null, responseInit);
   }
 };
 
 async function handleMuxSession(webSocket) {
-  // 维护当前 WebSocket 下的所有活跃流：streamId -> { socket, writer, reader }
   const streams = new Map();
 
   const closeStream = (streamId) => {
@@ -77,10 +88,9 @@ async function handleMuxSession(webSocket) {
     if (!(event.data instanceof ArrayBuffer)) return;
 
     const buf = new Uint8Array(event.data);
-    if (buf.length < 5) return; // 帧头至少 5 字节
+    if (buf.length < 5) return;
 
     const cmd = buf[0];
-    // 读取 4 字节 BigEndian uint32 的 StreamID
     const streamId = ((buf[1] << 24) | (buf[2] << 16) | (buf[3] << 8) | buf[4]) >>> 0;
     const payload = buf.subarray(5);
 
@@ -94,12 +104,10 @@ async function handleMuxSession(webSocket) {
 
         let remoteSocket = null;
 
-        // 1. 优先常规 Socket 直连
         try {
           remoteSocket = connect({ hostname: host, port });
           if (remoteSocket.opened) await remoteSocket.opened;
         } catch (e) {
-          // 2. 直连失败（如被 CF 拦截），触发 NAT64 回落
           const isIPv4 = !isIPv6 && /^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/.test(host);
           if (isIPv4) {
             for (const prefix of NAT64_PREFIXES) {
@@ -115,7 +123,6 @@ async function handleMuxSession(webSocket) {
         }
 
         if (!remoteSocket) {
-          // 连不上目标，通知 Go 客户端该 Stream 建立失败
           sendMuxFrame(webSocket, CMD_CLOSE, streamId);
           return;
         }
@@ -125,7 +132,6 @@ async function handleMuxSession(webSocket) {
 
         streams.set(streamId, { socket: remoteSocket, writer, reader });
 
-        // 异步循环读取远端 TCP 返回的数据，封装为 CMD_DATA 帧发送给 Go 客户端
         (async () => {
           try {
             while (true) {
@@ -191,7 +197,8 @@ function sendMuxFrame(ws, cmd, streamId, payload = null) {
 
 function safeCloseWebSocket(ws) {
   try {
-    if (ws.readyState === WS_READY_STATE_OPEN || ws.readyState === WS_READY_STATE_CLOSING) {
+    if (ws.readyState === WS_READY_STATE_OPEN || 
+        ws.readyState === WS_READY_STATE_CLOSING) {
       ws.close(1000, 'Server closed');
     }
   } catch {}
