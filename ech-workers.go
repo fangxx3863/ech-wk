@@ -556,4 +556,759 @@ func (c *MuxClient) Close() {
 	c.mu.Lock()
 	if c.isClosed {
 		c.mu.Unlock()
-		r
+		return
+	}
+	c.isClosed = true
+	_ = c.wsConn.Close()
+	c.mu.Unlock()
+	c.streams.Range(func(key, value interface{}) bool {
+		stream := value.(*MuxStream)
+		stream.pipeWriter.Close()
+		return true
+	})
+}
+
+type MuxPool struct {
+	serverAddr string
+	serverIP   string
+	token      string
+	client     *MuxClient
+	mu         sync.Mutex
+}
+
+func NewMuxPool(serverAddr, serverIP, token string) *MuxPool {
+	return &MuxPool{
+		serverAddr: serverAddr,
+		serverIP:   serverIP,
+		token:      token,
+	}
+}
+
+func (p *MuxPool) GetStream(target string) (*MuxStream, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.client != nil {
+		stream, err := p.client.OpenStream(target)
+		if err == nil {
+			return stream, nil
+		}
+		p.client.Close()
+		p.client = nil
+	}
+	log.Printf("[Mux] 正在建立新的 WebSocket 隧道...")
+	wsConn, err := dialWebSocketWithECH(2)
+	if err != nil {
+		return nil, fmt.Errorf("WebSocket 失败: %w", err)
+	}
+	p.client = NewMuxClient(wsConn)
+	return p.client.OpenStream(target)
+}
+
+// ======================== ECH 与 WebSocket ========================
+
+const typeHTTPS = 65
+
+func prepareECH() error {
+	echBase64, err := queryHTTPSRecord(echDomain, dnsServer)
+	if err != nil {
+		return fmt.Errorf("DNS 查询失败: %w", err)
+	}
+	if echBase64 == "" {
+		return errors.New("未找到 ECH 参数")
+	}
+	raw, err := base64.StdEncoding.DecodeString(echBase64)
+	if err != nil {
+		return fmt.Errorf("ECH 解码失败: %w", err)
+	}
+	echListMu.Lock()
+	echList = raw
+	echListMu.Unlock()
+	log.Printf("[ECH] 配置已加载，长度: %d 字节", len(raw))
+	return nil
+}
+
+func refreshECH() error {
+	return prepareECH()
+}
+
+func getECHList() ([]byte, error) {
+	echListMu.RLock()
+	defer echListMu.RUnlock()
+	if len(echList) == 0 {
+		return nil, errors.New("ECH 配置未加载")
+	}
+	return echList, nil
+}
+
+func buildTLSConfigWithECH(serverName string, echList []byte) (*tls.Config, error) {
+	roots, err := x509.SystemCertPool()
+	if err != nil {
+		return nil, err
+	}
+	config := &tls.Config{
+		MinVersion: tls.VersionTLS13,
+		ServerName: serverName,
+		RootCAs:    roots,
+	}
+	if len(echList) > 0 {
+		_ = setECHConfig(config, echList)
+	}
+	return config, nil
+}
+
+func setECHConfig(config *tls.Config, echList []byte) error {
+	configValue := reflect.ValueOf(config).Elem()
+	field1 := configValue.FieldByName("EncryptedClientHelloConfigList")
+	if field1.IsValid() && field1.CanSet() {
+		field1.Set(reflect.ValueOf(echList))
+	}
+	field2 := configValue.FieldByName("EncryptedClientHelloRejectionVerify")
+	if field2.IsValid() && field2.CanSet() {
+		rejectionFunc := func(cs tls.ConnectionState) error {
+			return errors.New("服务器拒绝 ECH")
+		}
+		field2.Set(reflect.ValueOf(rejectionFunc))
+	}
+	return nil
+}
+
+func queryHTTPSRecord(domain, dnsServer string) (string, error) {
+	dohURL := dnsServer
+	if !strings.HasPrefix(dohURL, "https://") && !strings.HasPrefix(dohURL, "http://") {
+		dohURL = "https://" + dohURL
+	}
+	return queryDoH(domain, dohURL)
+}
+
+func queryDoH(domain, dohURL string) (string, error) {
+	u, err := url.Parse(dohURL)
+	if err != nil {
+		return "", err
+	}
+	dnsQuery := buildDNSQuery(domain, typeHTTPS)
+	dnsBase64 := base64.RawURLEncoding.EncodeToString(dnsQuery)
+	q := u.Query()
+	q.Set("dns", dnsBase64)
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequest("GET", u.String(), nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Accept", "application/dns-message")
+	req.Header.Set("Content-Type", "application/dns-message")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	return parseDNSResponse(body)
+}
+
+func buildDNSQuery(domain string, qtype uint16) []byte {
+	query := make([]byte, 0, 512)
+	query = append(query, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
+	for _, label := range strings.Split(domain, ".") {
+		query = append(query, byte(len(label)))
+		query = append(query, []byte(label)...)
+	}
+	query = append(query, 0x00, byte(qtype>>8), byte(qtype), 0x00, 0x01)
+	return query
+}
+
+func parseDNSResponse(response []byte) (string, error) {
+	if len(response) < 12 {
+		return "", errors.New("响应过短")
+	}
+	ancount := binary.BigEndian.Uint16(response[6:8])
+	if ancount == 0 {
+		return "", errors.New("无应答记录")
+	}
+	offset := 12
+	for offset < len(response) && response[offset] != 0 {
+		offset += int(response[offset]) + 1
+	}
+	offset += 5
+	for i := 0; i < int(ancount); i++ {
+		if offset >= len(response) {
+			break
+		}
+		if response[offset]&0xC0 == 0xC0 {
+			offset += 2
+		} else {
+			for offset < len(response) && response[offset] != 0 {
+				offset += int(response[offset]) + 1
+			}
+			offset++
+		}
+		if offset+10 > len(response) {
+			break
+		}
+		rrType := binary.BigEndian.Uint16(response[offset : offset+2])
+		offset += 8
+		dataLen := binary.BigEndian.Uint16(response[offset : offset+2])
+		offset += 2
+		if offset+int(dataLen) > len(response) {
+			break
+		}
+		data := response[offset : offset+int(dataLen)]
+		offset += int(dataLen)
+		if rrType == typeHTTPS {
+			if ech := parseHTTPSRecord(data); ech != "" {
+				return ech, nil
+			}
+		}
+	}
+	return "", nil
+}
+
+func parseHTTPSRecord(data []byte) string {
+	if len(data) < 2 {
+		return ""
+	}
+	offset := 2
+	if offset < len(data) && data[offset] == 0 {
+		offset++
+	} else {
+		for offset < len(data) && data[offset] != 0 {
+			offset += int(data[offset]) + 1
+		}
+		offset++
+	}
+	for offset+4 <= len(data) {
+		key := binary.BigEndian.Uint16(data[offset : offset+2])
+		length := binary.BigEndian.Uint16(data[offset+2 : offset+4])
+		offset += 4
+		if offset+int(length) > len(data) {
+			break
+		}
+		value := data[offset : offset+int(length)]
+		offset += int(length)
+		if key == 5 {
+			return base64.StdEncoding.EncodeToString(value)
+		}
+	}
+	return ""
+}
+
+func parseServerAddr(addr string) (host, port, path string, err error) {
+	path = "/"
+	slashIdx := strings.Index(addr, "/")
+	if slashIdx != -1 {
+		path = addr[slashIdx:]
+		addr = addr[:slashIdx]
+	}
+	host, port, err = net.SplitHostPort(addr)
+	if err != nil {
+		return "", "", "", err
+	}
+	return host, port, path, nil
+}
+
+func dialWebSocketWithECH(maxRetries int) (*websocket.Conn, error) {
+	host, port, path, err := parseServerAddr(serverAddr)
+	if err != nil {
+		return nil, err
+	}
+	wsURL := fmt.Sprintf("wss://%s:%s%s", host, port, path)
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		echBytes, echErr := getECHList()
+		if echErr != nil {
+			if attempt < maxRetries {
+				refreshECH()
+				continue
+			}
+			return nil, echErr
+		}
+		tlsCfg, tlsErr := buildTLSConfigWithECH(host, echBytes)
+		if tlsErr != nil {
+			return nil, tlsErr
+		}
+		dialer := websocket.Dialer{
+			TLSClientConfig: tlsCfg,
+			Subprotocols: func() []string {
+				if token == "" {
+					return nil
+				}
+				return []string{token}
+			}(),
+			HandshakeTimeout: 10 * time.Second,
+		}
+		if serverIP != "" {
+			dialer.NetDial = func(network, address string) (net.Conn, error) {
+				_, port, err := net.SplitHostPort(address)
+				if err != nil {
+					return nil, err
+				}
+				return net.DialTimeout(network, net.JoinHostPort(serverIP, port), 10*time.Second)
+			}
+		}
+		wsConn, _, dialErr := dialer.Dial(wsURL, nil)
+		if dialErr != nil {
+			if strings.Contains(dialErr.Error(), "ECH") && attempt < maxRetries {
+				refreshECH()
+				time.Sleep(time.Second)
+				continue
+			}
+			return nil, dialErr
+		}
+		return wsConn, nil
+	}
+	return nil, errors.New("已达最大重试次数")
+}
+
+func queryDoHForProxy(dnsQuery []byte) ([]byte, error) {
+	_, port, _, err := parseServerAddr(serverAddr)
+	if err != nil {
+		return nil, err
+	}
+	dohURL := fmt.Sprintf("https://cloudflare-dns.com:%s/dns-query", port)
+	echBytes, err := getECHList()
+	if err != nil {
+		return nil, err
+	}
+	tlsCfg, err := buildTLSConfigWithECH("cloudflare-dns.com", echBytes)
+	if err != nil {
+		return nil, err
+	}
+	transport := &http.Transport{
+		TLSClientConfig: tlsCfg,
+	}
+	if serverIP != "" {
+		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			_, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			return (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, network, net.JoinHostPort(serverIP, port))
+		}
+	}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   10 * time.Second,
+	}
+	req, err := http.NewRequest("POST", dohURL, bytes.NewReader(dnsQuery))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/dns-message")
+	req.Header.Set("Accept", "application/dns-message")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("DoH error: %d", resp.StatusCode)
+	}
+	return io.ReadAll(resp.Body)
+}
+
+// ======================== 统一代理服务器 ========================
+
+const (
+	modeSOCKS5      = 1
+	modeHTTPConnect = 2
+	modeHTTPProxy   = 3
+)
+
+func runProxyServer(addr string) {
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatalf("[代理] 监听失败: %v", err)
+	}
+	defer listener.Close()
+
+	log.Printf("[代理] 服务器启动: %s (支持 SOCKS5 和 HTTP)", addr)
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			continue
+		}
+		go handleConnection(conn)
+	}
+}
+
+func handleConnection(conn net.Conn) {
+	defer conn.Close()
+	clientAddr := conn.RemoteAddr().String()
+	conn.SetDeadline(time.Now().Add(30 * time.Second))
+	buf := make([]byte, 1)
+	n, err := conn.Read(buf)
+	if err != nil || n == 0 {
+		return
+	}
+	firstByte := buf[0]
+	switch firstByte {
+	case 0x05:
+		handleSOCKS5(conn, clientAddr, firstByte)
+	case 'C', 'G', 'P', 'H', 'D', 'O', 'T':
+		handleHTTP(conn, clientAddr, firstByte)
+	}
+}
+
+func handleSOCKS5(conn net.Conn, clientAddr string, firstByte byte) {
+	if firstByte != 0x05 {
+		return
+	}
+	buf := make([]byte, 1)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return
+	}
+	methods := make([]byte, buf[0])
+	if _, err := io.ReadFull(conn, methods); err != nil {
+		return
+	}
+	if _, err := conn.Write([]byte{0x05, 0x00}); err != nil {
+		return
+	}
+	buf = make([]byte, 4)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return
+	}
+	if buf[0] != 5 {
+		return
+	}
+	command, atyp := buf[1], buf[3]
+	var host string
+	switch atyp {
+	case 0x01:
+		buf = make([]byte, 4)
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			return
+		}
+		host = net.IP(buf).String()
+	case 0x03:
+		buf = make([]byte, 1)
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			return
+		}
+		domainBuf := make([]byte, buf[0])
+		if _, err := io.ReadFull(conn, domainBuf); err != nil {
+			return
+		}
+		host = string(domainBuf)
+	case 0x04:
+		buf = make([]byte, 16)
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			return
+		}
+		host = net.IP(buf).String()
+	default:
+		conn.Write([]byte{0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
+	}
+	buf = make([]byte, 2)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return
+	}
+	port := int(buf[0])<<8 | int(buf[1])
+
+	switch command {
+	case 0x01: // CONNECT
+		target := fmt.Sprintf("%s:%d", host, port)
+		if atyp == 0x04 {
+			target = fmt.Sprintf("[%s]:%d", host, port)
+		}
+		_ = handleTunnel(conn, target, clientAddr, modeSOCKS5, "")
+	case 0x03: // UDP ASSOCIATE
+		handleUDPAssociate(conn, clientAddr)
+	default:
+		conn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+	}
+}
+
+func handleUDPAssociate(tcpConn net.Conn, clientAddr string) {
+	udpAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	if err != nil {
+		tcpConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
+	}
+	udpConn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		tcpConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
+	}
+	port := udpConn.LocalAddr().(*net.UDPAddr).Port
+	response := []byte{0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, byte(port >> 8), byte(port & 0xff)}
+	if _, err := tcpConn.Write(response); err != nil {
+		udpConn.Close()
+		return
+	}
+	stopChan := make(chan struct{})
+	go handleUDPRelay(udpConn, clientAddr, stopChan)
+	buf := make([]byte, 1)
+	tcpConn.Read(buf)
+	close(stopChan)
+	udpConn.Close()
+}
+
+func handleUDPRelay(udpConn *net.UDPConn, clientAddr string, stopChan chan struct{}) {
+	buf := make([]byte, 65535)
+	for {
+		select {
+		case <-stopChan:
+			return
+		default:
+		}
+		udpConn.SetReadDeadline(time.Now().Add(1 * time.Second))
+		n, addr, err := udpConn.ReadFromUDP(buf)
+		if err != nil {
+			continue
+		}
+		if n < 10 {
+			continue
+		}
+		data := buf[:n]
+		if data[2] != 0x00 {
+			continue
+		}
+		atyp := data[3]
+		var headerLen int
+		var dstPort int
+		switch atyp {
+		case 0x01:
+			if n < 10 {
+				continue
+			}
+			dstPort = int(data[8])<<8 | int(data[9])
+			headerLen = 10
+		case 0x03:
+			if n < 5 {
+				continue
+			}
+			domainLen := int(data[4])
+			if n < 7+domainLen {
+				continue
+			}
+			dstPort = int(data[5+domainLen])<<8 | int(data[6+domainLen])
+			headerLen = 7 + domainLen
+		case 0x04:
+			if n < 22 {
+				continue
+			}
+			dstPort = int(data[20])<<8 | int(data[21])
+			headerLen = 22
+		default:
+			continue
+		}
+		if dstPort == 53 {
+			go handleDNSQuery(udpConn, addr, data[headerLen:], data[:headerLen])
+		}
+	}
+}
+
+func handleDNSQuery(udpConn *net.UDPConn, clientAddr *net.UDPAddr, dnsQuery []byte, socks5Header []byte) {
+	dnsResponse, err := queryDoHForProxy(dnsQuery)
+	if err != nil {
+		return
+	}
+	response := append(socks5Header, dnsResponse...)
+	udpConn.WriteToUDP(response, clientAddr)
+}
+
+func handleHTTP(conn net.Conn, clientAddr string, firstByte byte) {
+	reader := bufio.NewReader(io.MultiReader(strings.NewReader(string(firstByte)), conn))
+	requestLine, err := reader.ReadString('\n')
+	if err != nil {
+		return
+	}
+	parts := strings.Fields(requestLine)
+	if len(parts) < 3 {
+		return
+	}
+	method, requestURL, httpVersion := parts[0], parts[1], parts[2]
+	headers := make(map[string]string)
+	var headerLines []string
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if line == "" {
+			break
+		}
+		headerLines = append(headerLines, line)
+		if idx := strings.Index(line, ":"); idx > 0 {
+			headers[strings.ToLower(strings.TrimSpace(line[:idx]))] = strings.TrimSpace(line[idx+1:])
+		}
+	}
+
+	if method == "CONNECT" {
+		_ = handleTunnel(conn, requestURL, clientAddr, modeHTTPConnect, "")
+	} else {
+		var target, path string
+		if strings.HasPrefix(requestURL, "http://") {
+			urlWithoutScheme := strings.TrimPrefix(requestURL, "http://")
+			idx := strings.Index(urlWithoutScheme, "/")
+			if idx > 0 {
+				target, path = urlWithoutScheme[:idx], urlWithoutScheme[idx:]
+			} else {
+				target, path = urlWithoutScheme, "/"
+			}
+		} else {
+			target, path = headers["host"], requestURL
+		}
+		if target == "" {
+			conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+			return
+		}
+		if !strings.Contains(target, ":") {
+			target += ":80"
+		}
+
+		var reqBuilder strings.Builder
+		reqBuilder.WriteString(fmt.Sprintf("%s %s %s\r\n", method, path, httpVersion))
+		for _, line := range headerLines {
+			k := strings.ToLower(strings.TrimSpace(strings.Split(line, ":")[0]))
+			if k != "proxy-connection" && k != "proxy-authorization" {
+				reqBuilder.WriteString(line + "\r\n")
+			}
+		}
+		reqBuilder.WriteString("\r\n")
+		if cl := headers["content-length"]; cl != "" {
+			var length int
+			fmt.Sscanf(cl, "%d", &length)
+			if length > 0 && length < 10*1024*1024 {
+				body := make([]byte, length)
+				if _, err := io.ReadFull(reader, body); err == nil {
+					reqBuilder.Write(body)
+				}
+			}
+		}
+		_ = handleTunnel(conn, target, clientAddr, modeHTTPProxy, reqBuilder.String())
+	}
+}
+
+func handleTunnel(conn net.Conn, target, clientAddr string, mode int, firstFrame string) error {
+	targetHost, _, err := net.SplitHostPort(target)
+	if err != nil {
+		targetHost = target
+	}
+
+	// 执行分流判断
+	if shouldBypassProxy(targetHost) {
+		log.Printf("[分流] %s -> %s (直连)", clientAddr, target)
+		return handleDirectConnection(conn, target, mode, firstFrame)
+	}
+
+	log.Printf("[分流] %s -> %s (通过代理 Mux)", clientAddr, target)
+
+	// 使用全局 Mux 复用池获取流
+	stream, err := globalMuxPool.GetStream(target)
+	if err != nil {
+		sendErrorResponse(conn, mode)
+		return err
+	}
+	defer stream.Close()
+
+	conn.SetDeadline(time.Time{})
+
+	// 针对纯 SOCKS5 连接，如果没有提供首帧数据，则主动探测一下（避免部分软件卡死）
+	if firstFrame == "" && mode == modeSOCKS5 {
+		_ = conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		buffer := make([]byte, 32768)
+		n, _ := conn.Read(buffer)
+		_ = conn.SetReadDeadline(time.Time{})
+		if n > 0 {
+			firstFrame = string(buffer[:n])
+		}
+	}
+
+	// 代理端回复连接成功
+	if err := sendSuccessResponse(conn, mode); err != nil {
+		return err
+	}
+
+	// 如果有数据包，发送出去
+	if firstFrame != "" {
+		if _, err := stream.Write([]byte(firstFrame)); err != nil {
+			return err
+		}
+	}
+
+	log.Printf("[代理] %s 已连接: %s", clientAddr, target)
+
+	done := make(chan bool, 2)
+	go func() {
+		io.Copy(stream, conn)
+		done <- true
+	}()
+	go func() {
+		io.Copy(conn, stream)
+		done <- true
+	}()
+	<-done
+	log.Printf("[代理] %s 已断开: %s", clientAddr, target)
+	return nil
+}
+
+func handleDirectConnection(conn net.Conn, target string, mode int, firstFrame string) error {
+	host, port, err := net.SplitHostPort(target)
+	if err != nil {
+		host = target
+		if mode == modeHTTPConnect || mode == modeHTTPProxy {
+			port = "443"
+		} else {
+			port = "80"
+		}
+		target = net.JoinHostPort(host, port)
+	}
+	targetConn, err := net.DialTimeout("tcp", target, 10*time.Second)
+	if err != nil {
+		sendErrorResponse(conn, mode)
+		return err
+	}
+	defer targetConn.Close()
+
+	if err := sendSuccessResponse(conn, mode); err != nil {
+		return err
+	}
+	if firstFrame != "" {
+		targetConn.Write([]byte(firstFrame))
+	}
+	done := make(chan bool, 2)
+	go func() {
+		io.Copy(targetConn, conn)
+		done <- true
+	}()
+	go func() {
+		io.Copy(conn, targetConn)
+		done <- true
+	}()
+	<-done
+	return nil
+}
+
+func sendErrorResponse(conn net.Conn, mode int) {
+	switch mode {
+	case modeSOCKS5:
+		conn.Write([]byte{0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+	case modeHTTPConnect, modeHTTPProxy:
+		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+	}
+}
+
+func sendSuccessResponse(conn net.Conn, mode int) error {
+	switch mode {
+	case modeSOCKS5:
+		_, err := conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return err
+	case modeHTTPConnect:
+		_, err := conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+		return err
+	}
+	return nil
+}
