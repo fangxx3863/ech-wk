@@ -95,38 +95,53 @@ func main() {
 		_ = loadChinaIPV6List()
 	}
 
-	// 启动后台守护式并发池
 	log.Printf("[启动] 初始化后台守护并发池，通道数: %d", poolSize)
 	globalMuxPool = NewMuxPool(serverAddr, serverIP, token, poolSize)
 
 	runProxyServer(listenAddr)
 }
 
-// ======================== Mux 核心流 ========================
+// ======================== Mux 核心异步无阻塞队列流 ========================
 
 type MuxStream struct {
-	id         uint32
-	client     *MuxClient
-	pipeReader *io.PipeReader
-	pipeWriter *io.PipeWriter
-	closeOnce  sync.Once
+	id        uint32
+	client    *MuxClient
+	dataChan  chan []byte
+	readBuf   []byte
+	closeOnce sync.Once
+	closed    uint32
 }
 
 func NewMuxStream(id uint32, client *MuxClient) *MuxStream {
-	pr, pw := io.Pipe()
 	return &MuxStream{
-		id:         id,
-		client:     client,
-		pipeReader: pr,
-		pipeWriter: pw,
+		id:     id,
+		client: client,
+		// 使用 2048 容量的异步缓冲队列，极大提升突发吞吐能力，并彻底切断死锁链条！
+		dataChan: make(chan []byte, 2048),
 	}
 }
 
-func (s *MuxStream) Read(b []byte) (int, error) {
-	return s.pipeReader.Read(b)
+func (s *MuxStream) Read(p []byte) (int, error) {
+	if len(s.readBuf) > 0 {
+		n := copy(p, s.readBuf)
+		s.readBuf = s.readBuf[n:]
+		return n, nil
+	}
+	b, ok := <-s.dataChan
+	if !ok {
+		return 0, io.EOF
+	}
+	n := copy(p, b)
+	if n < len(b) {
+		s.readBuf = b[n:]
+	}
+	return n, nil
 }
 
 func (s *MuxStream) Write(b []byte) (int, error) {
+	if atomic.LoadUint32(&s.closed) == 1 {
+		return 0, io.ErrClosedPipe
+	}
 	err := s.client.SendFrame(CMD_DATA, s.id, b)
 	if err != nil {
 		return 0, err
@@ -136,9 +151,9 @@ func (s *MuxStream) Write(b []byte) (int, error) {
 
 func (s *MuxStream) Close() error {
 	s.closeOnce.Do(func() {
+		atomic.StoreUint32(&s.closed, 1)
 		_ = s.client.SendFrame(CMD_CLOSE, s.id, nil)
-		s.pipeWriter.Close()
-		s.pipeReader.Close()
+		close(s.dataChan)
 		s.client.removeStream(s.id)
 	})
 	return nil
@@ -229,11 +244,17 @@ func (c *MuxClient) readLoop() {
 		switch cmd {
 		case CMD_DATA:
 			if len(payload) > 0 {
-				_, _ = stream.pipeWriter.Write(payload)
+				select {
+				case stream.dataChan <- payload:
+					// 成功推入独立队列，不阻塞 WebSocket 主线程
+				default:
+					// 如果该子连接卡死导致 2048 队列爆满，强制将其击毙！保全所有其他连接！
+					log.Printf("[Mux] 警告: 子流 %d 消费过慢堆积严重，已强行掐断防死锁！", streamID)
+					stream.Close()
+				}
 			}
 		case CMD_CLOSE:
-			stream.pipeWriter.Close()
-			c.streams.Delete(streamID)
+			stream.Close()
 		}
 	}
 }
@@ -264,7 +285,7 @@ func (c *MuxClient) Close() {
 	c.mu.Unlock()
 	c.streams.Range(func(key, value interface{}) bool {
 		stream := value.(*MuxStream)
-		stream.pipeWriter.Close()
+		stream.Close()
 		return true
 	})
 }
@@ -298,7 +319,6 @@ func (p *MuxPool) maintainConnection(id int, serverAddr, serverIP, token string)
 	for {
 		wsConn, err := dialWebSocketWithECH(serverAddr, serverIP, token, 1)
 		if err != nil {
-			log.Printf("[通道 #%d] 建立失败: %v, 3秒后重试", id+1, err)
 			time.Sleep(3 * time.Second)
 			continue
 		}
