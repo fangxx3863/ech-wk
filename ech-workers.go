@@ -287,7 +287,6 @@ func NewMuxPool(serverAddr, serverIP, token string, size int) *MuxPool {
 		clients:  make([]*MuxClient, size),
 	}
 
-	// 启动后台守护协程维持连接池
 	for i := 0; i < size; i++ {
 		go p.maintainConnection(i, serverAddr, serverIP, token)
 	}
@@ -297,7 +296,7 @@ func NewMuxPool(serverAddr, serverIP, token string, size int) *MuxPool {
 
 func (p *MuxPool) maintainConnection(id int, serverAddr, serverIP, token string) {
 	for {
-		wsConn, err := dialWebSocketWithECH(serverAddr, serverIP, token, 1) // 单次尝试
+		wsConn, err := dialWebSocketWithECH(serverAddr, serverIP, token, 1)
 		if err != nil {
 			log.Printf("[通道 #%d] 建立失败: %v, 3秒后重试", id+1, err)
 			time.Sleep(3 * time.Second)
@@ -312,7 +311,6 @@ func (p *MuxPool) maintainConnection(id int, serverAddr, serverIP, token string)
 		
 		log.Printf("[通道 #%d] 🚀 极速通道建立成功，已加入复用池", id+1)
 
-		// 阻塞等待断开信号
 		<-client.closeChan
 
 		p.mu.Lock()
@@ -330,7 +328,6 @@ func (p *MuxPool) GetStream(target string) (*MuxStream, error) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
-	// 轮询抓取一个健康的通道（非阻塞）
 	for i := 0; i < p.poolSize; i++ {
 		idx := (startIdx + uint32(i)) % uint32(p.poolSize)
 		client := p.clients[idx]
@@ -546,6 +543,35 @@ func parseDNSResponse(response []byte) (string, error) {
 		}
 	}
 	return "", nil
+}
+
+func parseHTTPSRecord(data []byte) string {
+	if len(data) < 2 {
+		return ""
+	}
+	offset := 2
+	if offset < len(data) && data[offset] == 0 {
+		offset++
+	} else {
+		for offset < len(data) && data[offset] != 0 {
+			offset += int(data[offset]) + 1
+		}
+		offset++
+	}
+	for offset+4 <= len(data) {
+		key := binary.BigEndian.Uint16(data[offset : offset+2])
+		length := binary.BigEndian.Uint16(data[offset+2 : offset+4])
+		offset += 4
+		if offset+int(length) > len(data) {
+			break
+		}
+		value := data[offset : offset+int(length)]
+		offset += int(length)
+		if key == 5 {
+			return base64.StdEncoding.EncodeToString(value)
+		}
+	}
+	return ""
 }
 
 // ======================== 工具与分流逻辑 ========================
@@ -941,7 +967,6 @@ func handleTunnel(conn net.Conn, target, clientAddr string, mode int, firstFrame
 		return handleDirectConnection(conn, target, mode, firstFrame)
 	}
 
-	// 闪电并发：不再同步拨号，直接从守护池中抓取一个活跃通道
 	stream, err := globalMuxPool.GetStream(target)
 	if err != nil {
 		sendErrorResponse(conn, mode)
