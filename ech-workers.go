@@ -31,6 +31,7 @@ const (
 	CMD_OPEN  byte = 0x01
 	CMD_DATA  byte = 0x02
 	CMD_CLOSE byte = 0x03
+	MAX_STREAMS_PER_CLIENT = 12 // 单条通道负载上限，防止 CF 端爆内存
 )
 
 // ======================== 全局参数 ========================
@@ -43,7 +44,6 @@ var (
 	dnsServer   string
 	echDomain   string
 	routingMode string
-	poolSize    int
 
 	echListMu sync.RWMutex
 	echList   []byte
@@ -74,7 +74,6 @@ func init() {
 	flag.StringVar(&dnsServer, "dns", "dns.alidns.com/dns-query", "ECH 查询 DoH 服务器")
 	flag.StringVar(&echDomain, "ech", "cloudflare-ech.com", "ECH 查询域名")
 	flag.StringVar(&routingMode, "routing", "global", "分流模式: global(全局代理), bypass_cn(跳过中国大陆), none(不改变代理)")
-	flag.IntVar(&poolSize, "pool", 4, "Mux 并发 WebSocket 隧道连接池大小 (推荐 4-8)")
 }
 
 func main() {
@@ -95,13 +94,12 @@ func main() {
 		_ = loadChinaIPV6List()
 	}
 
-	log.Printf("[启动] 初始化后台守护并发池，通道数: %d", poolSize)
-	globalMuxPool = NewMuxPool(serverAddr, serverIP, token, poolSize)
+	globalMuxPool = NewMuxPool(serverAddr, serverIP, token)
 
 	runProxyServer(listenAddr)
 }
 
-// ======================== Mux 核心异步无阻塞队列流 ========================
+// ======================== Mux 核心非阻塞流 ========================
 
 type MuxStream struct {
 	id        uint32
@@ -114,10 +112,9 @@ type MuxStream struct {
 
 func NewMuxStream(id uint32, client *MuxClient) *MuxStream {
 	return &MuxStream{
-		id:     id,
-		client: client,
-		// 使用 2048 容量的异步缓冲队列，极大提升突发吞吐能力，并彻底切断死锁链条！
-		dataChan: make(chan []byte, 2048),
+		id:       id,
+		client:   client,
+		dataChan: make(chan []byte, 1024),
 	}
 }
 
@@ -160,37 +157,31 @@ func (s *MuxStream) Close() error {
 }
 
 type MuxClient struct {
-	wsConn    *websocket.Conn
-	mu        sync.Mutex
-	streams   sync.Map
-	streamSeq uint32
-	isClosed  bool
-	closeChan chan struct{}
+	wsConn     *websocket.Conn
+	mu         sync.Mutex
+	streams    sync.Map
+	streamSeq  uint32
+	activeCount int32
+	isClosed   bool
 }
 
 func NewMuxClient(ws *websocket.Conn) *MuxClient {
 	c := &MuxClient{
-		wsConn:    ws,
-		closeChan: make(chan struct{}),
+		wsConn: ws,
 	}
 	go c.readLoop()
 	go c.pingLoop()
 	return c
 }
 
-func (c *MuxClient) IsClosed() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.isClosed
-}
-
 func (c *MuxClient) OpenStream(target string) (*MuxStream, error) {
 	c.mu.Lock()
-	if c.isClosed {
+	if c.isClosed || atomic.LoadInt32(&c.activeCount) >= MAX_STREAMS_PER_CLIENT {
 		c.mu.Unlock()
-		return nil, fmt.Errorf("websocket 已关闭")
+		return nil, fmt.Errorf("通道不可用或已满载")
 	}
 	streamID := atomic.AddUint32(&c.streamSeq, 1)
+	atomic.AddInt32(&c.activeCount, 1)
 	stream := NewMuxStream(streamID, c)
 	c.streams.Store(streamID, stream)
 	c.mu.Unlock()
@@ -204,7 +195,9 @@ func (c *MuxClient) OpenStream(target string) (*MuxStream, error) {
 }
 
 func (c *MuxClient) removeStream(id uint32) {
-	c.streams.Delete(id)
+	if _, loaded := c.streams.LoadAndDelete(id); loaded {
+		atomic.AddInt32(&c.activeCount, -1)
+	}
 }
 
 func (c *MuxClient) SendFrame(cmd byte, streamID uint32, payload []byte) error {
@@ -246,10 +239,7 @@ func (c *MuxClient) readLoop() {
 			if len(payload) > 0 {
 				select {
 				case stream.dataChan <- payload:
-					// 成功推入独立队列，不阻塞 WebSocket 主线程
 				default:
-					// 如果该子连接卡死导致 2048 队列爆满，强制将其击毙！保全所有其他连接！
-					log.Printf("[Mux] 警告: 子流 %d 消费过慢堆积严重，已强行掐断防死锁！", streamID)
 					stream.Close()
 				}
 			}
@@ -281,7 +271,6 @@ func (c *MuxClient) Close() {
 	}
 	c.isClosed = true
 	_ = c.wsConn.Close()
-	close(c.closeChan)
 	c.mu.Unlock()
 	c.streams.Range(func(key, value interface{}) bool {
 		stream := value.(*MuxStream)
@@ -290,69 +279,36 @@ func (c *MuxClient) Close() {
 	})
 }
 
-// ======================== 后台守护式连接池 ========================
+// ======================== 智能容量调节连接池 ========================
 
 type MuxPool struct {
-	poolSize int
-	clients  []*MuxClient
-	index    uint32
-	mu       sync.RWMutex
+	serverAddr string
+	serverIP   string
+	token      string
+	clients    []*MuxClient
+	mu         sync.Mutex
 }
 
-func NewMuxPool(serverAddr, serverIP, token string, size int) *MuxPool {
-	if size <= 0 {
-		size = 4
-	}
-	p := &MuxPool{
-		poolSize: size,
-		clients:  make([]*MuxClient, size),
-	}
-
-	for i := 0; i < size; i++ {
-		go p.maintainConnection(i, serverAddr, serverIP, token)
-	}
-
-	return p
-}
-
-func (p *MuxPool) maintainConnection(id int, serverAddr, serverIP, token string) {
-	for {
-		wsConn, err := dialWebSocketWithECH(serverAddr, serverIP, token, 1)
-		if err != nil {
-			time.Sleep(3 * time.Second)
-			continue
-		}
-
-		client := NewMuxClient(wsConn)
-		
-		p.mu.Lock()
-		p.clients[id] = client
-		p.mu.Unlock()
-		
-		log.Printf("[通道 #%d] 🚀 极速通道建立成功，已加入复用池", id+1)
-
-		<-client.closeChan
-
-		p.mu.Lock()
-		p.clients[id] = nil
-		p.mu.Unlock()
-
-		log.Printf("[通道 #%d] ⚠️ 通道断开，准备自动重连...", id+1)
-		time.Sleep(1 * time.Second)
+func NewMuxPool(serverAddr, serverIP, token string) *MuxPool {
+	return &MuxPool{
+		serverAddr: serverAddr,
+		serverIP:   serverIP,
+		token:      token,
 	}
 }
 
 func (p *MuxPool) GetStream(target string) (*MuxStream, error) {
-	startIdx := atomic.AddUint32(&p.index, 1)
-	
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
-	for i := 0; i < p.poolSize; i++ {
-		idx := (startIdx + uint32(i)) % uint32(p.poolSize)
-		client := p.clients[idx]
-
-		if client != nil && !client.IsClosed() {
+	// 1. 优先使用已有的未满载通道
+	for i := len(p.clients) - 1; i >= 0; i-- {
+		client := p.clients[i]
+		if client.isClosed {
+			p.clients = append(p.clients[:i], p.clients[i+1:]...)
+			continue
+		}
+		if atomic.LoadInt32(&client.activeCount) < MAX_STREAMS_PER_CLIENT {
 			stream, err := client.OpenStream(target)
 			if err == nil {
 				return stream, nil
@@ -360,10 +316,18 @@ func (p *MuxPool) GetStream(target string) (*MuxStream, error) {
 		}
 	}
 
-	return nil, fmt.Errorf("所有复用通道均不可用，请等待后台自动重连")
+	// 2. 所有通道均已满载，按需新建新的复用通道
+	wsConn, err := dialWebSocketWithECH(p.serverAddr, p.serverIP, p.token, 2)
+	if err != nil {
+		return nil, fmt.Errorf("新建 Mux 管道失败: %w", err)
+	}
+
+	newClient := NewMuxClient(wsConn)
+	p.clients = append(p.clients, newClient)
+	return newClient.OpenStream(target)
 }
 
-// ======================== ECH 与 WebSocket 拨号器 ========================
+// ======================== ECH 与 拨号逻辑 ========================
 
 func dialWebSocketWithECH(serverAddr, serverIP, token string, maxRetries int) (*websocket.Conn, error) {
 	host, port, path, err := parseServerAddr(serverAddr)
@@ -372,7 +336,6 @@ func dialWebSocketWithECH(serverAddr, serverIP, token string, maxRetries int) (*
 	}
 	wsURL := fmt.Sprintf("wss://%s:%s%s", host, port, path)
 
-	var lastErr error
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		echBytes, _ := getECHList()
 		tlsCfg, _ := buildTLSConfigWithECH(host, echBytes)
@@ -404,14 +367,12 @@ func dialWebSocketWithECH(serverAddr, serverIP, token string, maxRetries int) (*
 		if dialErr == nil {
 			return wsConn, nil
 		}
-		
-		lastErr = dialErr
 		if strings.Contains(dialErr.Error(), "ECH") {
 			refreshECH()
 		}
 		time.Sleep(time.Second)
 	}
-	return nil, lastErr
+	return nil, errors.New("连接失败")
 }
 
 func parseServerAddr(addr string) (host, port, path string, err error) {
@@ -431,7 +392,7 @@ func parseServerAddr(addr string) (host, port, path string, err error) {
 func prepareECH() error {
 	echBase64, err := queryHTTPSRecord(echDomain, dnsServer)
 	if err != nil || echBase64 == "" {
-		return fmt.Errorf("DNS error or empty ECH")
+		return fmt.Errorf("DNS error")
 	}
 	raw, err := base64.StdEncoding.DecodeString(echBase64)
 	if err != nil {
@@ -594,7 +555,7 @@ func parseHTTPSRecord(data []byte) string {
 	return ""
 }
 
-// ======================== 工具与分流逻辑 ========================
+// ======================== 工具与分流 ========================
 
 func ipToUint32(ip net.IP) uint32 {
 	ip = ip.To4()
@@ -987,6 +948,7 @@ func handleTunnel(conn net.Conn, target, clientAddr string, mode int, firstFrame
 		return handleDirectConnection(conn, target, mode, firstFrame)
 	}
 
+	// 动态按需调度：未满载就用旧通道（0 延迟），满了自动扩容开新通道
 	stream, err := globalMuxPool.GetStream(target)
 	if err != nil {
 		sendErrorResponse(conn, mode)
